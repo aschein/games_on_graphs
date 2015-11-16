@@ -64,7 +64,10 @@ class TwoPlayerGame:
         agent2_coords = get_random_neighbor(agent1_coords, self.shp)
         return agent1_coords, agent2_coords
 
-    def play(self, payoffs, n_iter):
+    def _update_plot(self):
+        raise NotImplementedError
+
+    def play(self, payoffs, n_iter=10000, plot_every=100):
         payoffs = self._preprocess(payoffs)
 
         for itn in xrange(n_iter):
@@ -83,6 +86,9 @@ class TwoPlayerGame:
 
                 self.state[agent1_coords] = new_strat
                 self.state[agent2_coords] = new_strat
+
+                if itn % plot_every == 0:
+                    self._update_plot()
 
             except KeyboardInterrupt:
                 if raw_input("\nSimulation paused.\
