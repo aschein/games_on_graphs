@@ -4,32 +4,16 @@ Game interfaces for simulating evolutionary games on graphs.
 import numpy as np
 import numpy.random as rn
 
-
-def is_valid_coords(coords, shp):  # hacky
-    try:
-        np.ravel_multi_index(coords, shp)
-        return True
-    except ValueError:
-        return False
+from utils import get_random_neighbor
 
 
-def get_random_neighbor(coords, shp):
-    tmp = np.asarray(coords)
-    valid = False
-    while (tuple(tmp) == coords) or (not valid):
-        rand_dim = rn.choice(tmp.size)
-        if (tmp[rand_dim] == 0):
-            tmp[rand_dim] = 1
-        elif (tmp[rand_dim] == shp[rand_dim] - 1):
-            tmp[rand_dim] -= 1
-        else:
-            tmp[rand_dim] += rn.choice([-1, 1])
-        valid = is_valid_coords(tmp, shp)
-    return tuple(tmp)
+class Game:
+    """ The basic Game interface to inherit from.
 
+    Inheriting sub-classes must implement the methods:
 
-class TwoPlayerGame:
-    """ The basic 2-player Game interface to inherit from.
+            1) _get_matchup: Randomly match 2+ players
+            2) _update: Update the game state based on payoffs and randomly matched players
 
     Parameters
     ----------
@@ -47,11 +31,17 @@ class TwoPlayerGame:
             Every agent (i1, ... iD) on the lattice has a mixed strategy.
     """
 
-    def __init__(self, shp, n_strategies=3, alpha=0.):
+    def __init__(self, shp, n_strategies=3):
         self.shp = shp
         self.n_agents = np.prod(shp)
         self.n_strategies = n_strategies
         self._state = np.zeros(shp + (n_strategies,))
+
+    def _get_matchup(self):
+        raise NotImplementedError
+
+    def _update(self, payoffs, *players):
+        raise NotImplementedError
 
     def _preprocess(self, payoffs):
         assert isinstance(payoffs, np.ndarray)
@@ -65,7 +55,7 @@ class TwoPlayerGame:
 
     def _initalize(self, version):
         if version == 'uniform':
-            self._state[:] = 1. / float(n_strategies)
+            self._state[:] = 1. / float(self.n_strategies)
 
         elif version == 'random mixed':
             self._state[:] = rn.dirichlet(np.ones(self.n_strategies), size=self.shp)
@@ -80,12 +70,6 @@ class TwoPlayerGame:
         marg = self.get_marginal()
         assert np.allclose(marg.sum(), 1)
 
-    def _get_matchup(self):
-        agent1 = rn.choice(self.n_agents)
-        agent1_coords = np.unravel_index(agent1, self.shp)
-        agent2_coords = get_random_neighbor(agent1_coords, self.shp)
-        return agent1_coords, agent2_coords
-
     def get_state(self):
         return self._state.copy()
 
@@ -93,45 +77,99 @@ class TwoPlayerGame:
         return self._state.reshape((-1, self.n_strategies)).mean(axis=0)
 
     def play(self, payoffs, init=None, n_iter=1000):
-        if init is not None:
-            self._initalize(version=init)
-
         payoffs = self._preprocess(payoffs)
+        if isinstance(init, str):
+            self._initalize(version=init)
+        elif isinstance(init, np.ndarray):
+            assert init.shape == self._state.shape
+            self._state[:] = init
 
         for itn in xrange(n_iter):
-            agent1_coords, agent2_coords = self._get_matchup()
-            agent1_strat = self._state[agent1_coords]
-            agent2_strat = self._state[agent2_coords]
-
-            agent1_payoff = np.dot(np.dot(agent1_strat, payoffs), agent2_strat)
-            agent2_payoff = np.dot(np.dot(agent1_strat, payoffs.T), agent2_strat)
-
-            net_payoff = agent1_payoff + agent2_payoff
-
-            if net_payoff == 0:  # zero-sum game
-                agent1_wins = agent1_payoff > agent2_payoff
-                new_strat = agent1_strat if agent1_wins else agent2_strat
-
-            else:
-                rel_payoffs = np.zeros(2)
-                rel_payoffs[0] = agent1_payoff / net_payoff
-                rel_payoffs[1] = agent2_payoff / net_payoff
-
-                new_strat = agent1_strat * (agent1_payoff / net_payoff) + \
-                            agent2_strat * (agent2_payoff / net_payoff)
-
-            self._state[agent1_coords] = new_strat
-            self._state[agent2_coords] = new_strat
+            players = self._get_matchup()
+            self._update(payoffs, *players)
 
 
-if __name__ == '__main__':
-    shp = (100, 100)
-    n_strategies = 3
-    alpha = 0
+class TwoPlayerImitationGame(Game):
+    """ A basic TwoPlayerGame interface.
 
-    payoffs = np.array([[  0.,  1.,  1.],
-                        [ -1.,  0.,  0.],
-                        [ -1.,  0.,  0.]])  # rock-paper-scissors
+    _get_matchup : Random neighbor matching.
+    _update  : Loser adopts strategy of winner with some probability.
 
-    game = TwoPlayerGame(shp=shp, n_strategies=n_strategies, alpha=alpha)
-    game.play(payoffs, init='random pure')
+    Basic diffusion process.
+    """
+
+    def __init__(self, shp, n_strategies=3, version='Boltzman'):
+        self.version = version
+        Game.__init__(self, shp=shp, n_strategies=n_strategies)
+
+    def _get_matchup(self):
+        agent1 = rn.choice(self.n_agents)
+        agent1_coords = np.unravel_index(agent1, self.shp)
+        agent2_coords = get_random_neighbor(agent1_coords, self.shp)
+        return agent1_coords, agent2_coords
+
+    def _update(self, payoffs, *players):
+        p1_coords, p2_coords = players
+        p1_strat = self._state[p1_coords]
+        p2_strat = self._state[p2_coords]
+
+        p1_payoff = np.dot(np.dot(p1_strat, payoffs), p2_strat)
+        p2_payoff = np.dot(np.dot(p1_strat, payoffs.T), p2_strat)
+
+        p1_wins = p1_payoff > p2_payoff
+        losing_player = p2_coords if p1_wins else p1_coords
+        winning_strat = p1_strat if p1_wins else p2_strat
+
+        if self.version is None:
+            # Loser always imitates
+            self._state[losing_player] = winning_strat
+
+        elif self.version == 'Boltzman':
+            # Probability of imitation is Boltzman form
+            Z = np.exp(p1_payoff) + np.exp(p2_payoff)
+            winning_payoff = p1_payoff if p1_wins else p2_payoff
+            if (np.exp(winning_payoff) / Z) > rn.random():
+                self._state[losing_player] = winning_strat
+        else:
+            raise ValueError
+
+
+class TwoPlayerBestResponseGame(Game):
+    """ A basic TwoPlayerGame interface.
+
+    _get_matchup : Random neighbor matching.
+    _update  :  Players choose a pure strategy at random from their distribution.
+                Both players adopt a weighted average of their strategies.
+    """
+
+    def __init__(self, shp, n_strategies=3, version='Boltzman'):
+        self.version = version
+        Game.__init__(self, shp=shp, n_strategies=n_strategies)
+
+    def _get_matchup(self):
+        agent1 = rn.choice(self.n_agents)
+        agent1_coords = np.unravel_index(agent1, self.shp)
+        agent2_coords = get_random_neighbor(agent1_coords, self.shp)
+        return agent1_coords, agent2_coords
+
+    def _update(self, payoffs, *players):
+        p1_coords, p2_coords = players
+        p1_strat = self._state[p1_coords]
+        p2_strat = self._state[p2_coords]
+
+        p1_payoff = np.dot(np.dot(p1_strat, payoffs), p2_strat)
+        p2_payoff = np.dot(np.dot(p1_strat, payoffs.T), p2_strat)
+        p1_wins = p1_payoff > p2_payoff
+
+        winning_strat = p1_strat if p1_wins else p2_strat
+        winning_payoff = p1_payoff if p1_wins else p2_payoff
+
+        losing_strat = p2_strat if p1_wins else p1_strat
+        losing_payoff = p2_payoff if p1_wins else p1_payoff
+
+        Z = np.exp(winning_payoff) + np.exp(losing_payoff)
+        new_strat = winning_strat * (np.exp(winning_payoff) / Z) + \
+                    losing_strat * (np.exp(losing_payoff) / Z)
+        assert (new_strat >= 0).all() and np.allclose(new_strat.sum(), 1.)
+
+        self._state[p1_coords] = self._state[p2_coords] = new_strat
